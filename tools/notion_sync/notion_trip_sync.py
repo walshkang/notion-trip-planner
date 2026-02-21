@@ -34,6 +34,7 @@ import json
 import os
 import random
 import re
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -182,6 +183,65 @@ def _extract_json_from_text(text: str) -> Dict[str, Any]:
 def load_payload(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return _extract_json_from_text(f.read())
+
+
+def count_sync_targets(payload: Dict[str, Any]) -> int:
+    total = 0
+    trip = payload.get("trip") or {}
+    if isinstance(trip, dict) and trip.get("row_id"):
+        total += 1
+
+    for key in ("categories", "places", "items"):
+        for obj in payload.get(key) or []:
+            if isinstance(obj, dict) and obj.get("row_id"):
+                total += 1
+    return total
+
+
+class ProgressRenderer:
+    FRAMES = ("|", "/", "-", "\\")
+
+    def __init__(self, total: int, *, enabled: bool = True, stream: Any = None):
+        self.total = total
+        self.enabled = enabled
+        self.stream = stream if stream is not None else sys.stderr
+        self._is_tty = bool(enabled and hasattr(self.stream, "isatty") and self.stream.isatty())
+        self._count = 0
+        self._start_ts = time.time()
+
+    def begin(self, *, mode: str, dry_run: bool) -> None:
+        if not self.enabled:
+            return
+        run_kind = "DRY RUN" if dry_run else "APPLY"
+        print(f"[sync] {run_kind} mode={mode} targets={self.total}", file=self.stream)
+
+    def tick(self, *, stage: str, row_id: str, action: str) -> None:
+        if not self.enabled:
+            return
+        self._count += 1
+        frame = self.FRAMES[(self._count - 1) % len(self.FRAMES)]
+        total = self.total if self.total > 0 else 1
+        pct = int((self._count / total) * 100)
+        bar_width = 24
+        fill = int((self._count / total) * bar_width)
+        bar = ("#" * fill) + ("." * (bar_width - fill))
+        short_row_id = row_id if len(row_id) <= 40 else (row_id[:37] + "...")
+        line = f"{frame} [{bar}] {self._count}/{total} {pct:3d}% {action:<6} {stage:<8} {short_row_id}"
+        if self._is_tty:
+            self.stream.write("\r" + line)
+            self.stream.flush()
+        else:
+            print(f"[sync] {line}", file=self.stream)
+
+    def finish(self, *, success: bool) -> None:
+        if not self.enabled:
+            return
+        if self._is_tty:
+            self.stream.write("\n")
+            self.stream.flush()
+        elapsed = time.time() - self._start_ts
+        status = "done" if success else "aborted"
+        print(f"[sync] {status} in {elapsed:.1f}s", file=self.stream)
 
 
 EXPECTED_PROPERTY_NAMES = {
@@ -451,7 +511,18 @@ def build_base_properties(schema: DataSourceSchema, cfg_props: Dict[str, Any], *
     set_prop(out, pid, ptype, checkbox_value_bool(scaffold))
     return out
 
-def sync_payload(notion: NotionClient, schema: DataSourceSchema, config: Dict[str, Any], payload: Dict[str, Any], *, dry_run: bool, enable_place: bool, mode: str, strict: bool) -> Dict[str, Any]:
+def sync_payload(
+    notion: NotionClient,
+    schema: DataSourceSchema,
+    config: Dict[str, Any],
+    payload: Dict[str, Any],
+    *,
+    dry_run: bool,
+    enable_place: bool,
+    mode: str,
+    strict: bool,
+    progress: Optional[ProgressRenderer] = None,
+) -> Dict[str, Any]:
     cfg_props: Dict[str, Any] = config.get("properties") or {}
     warnings: List[str] = []
     relation_enabled = validate_schema_requirements(schema, cfg_props, mode=mode, strict=strict, warnings=warnings)
@@ -508,6 +579,8 @@ def sync_payload(notion: NotionClient, schema: DataSourceSchema, config: Dict[st
     trip_page_id, act = upsert_page(notion, schema, row_id_prop_id, trip_row_id, trip_props, dry_run=dry_run, strict=strict, warnings=warnings)
     actions.append(act)
     page_ids[trip_row_id] = trip_page_id
+    if progress:
+        progress.tick(stage="trip", row_id=trip_row_id, action=act)
 
     # Categories
     for cat in payload.get("categories") or []:
@@ -534,6 +607,8 @@ def sync_payload(notion: NotionClient, schema: DataSourceSchema, config: Dict[st
         _, act = upsert_page(notion, schema, row_id_prop_id, rid, props, dry_run=dry_run, strict=strict, warnings=warnings)
         actions.append(act)
         page_ids[rid] = page_ids.get(rid) or _
+        if progress:
+            progress.tick(stage="category", row_id=rid, action=act)
 
     # Places
     for pl in payload.get("places") or []:
@@ -592,6 +667,8 @@ def sync_payload(notion: NotionClient, schema: DataSourceSchema, config: Dict[st
         pl_page_id, act = upsert_page(notion, schema, row_id_prop_id, rid, props, dry_run=dry_run, strict=strict, warnings=warnings)
         actions.append(act)
         page_ids[rid] = pl_page_id
+        if progress:
+            progress.tick(stage="place", row_id=rid, action=act)
 
     # Items
     for it in payload.get("items") or []:
@@ -692,6 +769,8 @@ def sync_payload(notion: NotionClient, schema: DataSourceSchema, config: Dict[st
         _, act = upsert_page(notion, schema, row_id_prop_id, rid, props, dry_run=dry_run, strict=strict, warnings=warnings)
         actions.append(act)
         page_ids[rid] = _
+        if progress:
+            progress.tick(stage="item", row_id=rid, action=act)
 
     stats = {"create": actions.count("CREATE"), "update": actions.count("UPDATE"), "total": len(actions)}
     return {"page_ids": page_ids, "stats": stats, "warnings": warnings}
@@ -740,13 +819,21 @@ def cmd_apply(args: argparse.Namespace) -> None:
     schema = build_schema(ds_obj)
 
     payload = load_payload(args.payload)
-    res = sync_payload(
-        notion, schema, config, payload,
-        dry_run=bool(args.dry_run),
-        enable_place=bool(args.enable_place),
-        mode=args.mode,
-        strict=bool(args.strict),
-    )
+    progress = ProgressRenderer(count_sync_targets(payload), enabled=not bool(args.no_progress))
+    progress.begin(mode=args.mode, dry_run=bool(args.dry_run))
+    success = False
+    try:
+        res = sync_payload(
+            notion, schema, config, payload,
+            dry_run=bool(args.dry_run),
+            enable_place=bool(args.enable_place),
+            mode=args.mode,
+            strict=bool(args.strict),
+            progress=progress,
+        )
+        success = True
+    finally:
+        progress.finish(success=success)
 
     stats = res["stats"]
     print(f"\n{'DRY RUN' if args.dry_run else 'APPLY'} complete. Mode={args.mode}. Created={stats['create']} Updated={stats['update']} Total={stats['total']}")
@@ -778,6 +865,7 @@ def main() -> None:
     ap_apply.add_argument("--dry-run", action="store_true")
     ap_apply.add_argument("--enable-place", action="store_true")
     ap_apply.add_argument("--print-ids", action="store_true")
+    ap_apply.add_argument("--no-progress", action="store_true", help="Disable progress rendering during apply.")
     ap_apply.add_argument("--database-id", default=None)
     ap_apply.add_argument("--token", default=None)
     ap_apply.set_defaults(func=cmd_apply)

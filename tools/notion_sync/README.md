@@ -44,6 +44,21 @@ Payload may be either:
 - raw JSON
 - a transcript containing a fenced JSON block (```json ... ```)
 
+## Loading/progress UI during apply
+`apply` shows a live progress line while rows are upserted (works for both dry run and live apply).
+
+Example:
+```text
+[sync] DRY RUN mode=patch targets=38
+| [#####...................] 8/38  21% CREATE category cat_meal_ireland_2026_03_05
+[sync] done in 1.2s
+```
+
+Disable progress rendering when piping output:
+```bash
+python notion_trip_sync.py apply --config config.json --payload payload.json --no-progress
+```
+
 ## First-live-write safety policy
 Always do first run with strict dry-run patch mode:
 ```bash
