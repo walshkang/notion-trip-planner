@@ -14,7 +14,7 @@ class TestProgressUi(unittest.TestCase):
             "places": [{"row_id": "place_1"}, "bad"],
             "items": [{"row_id": "item_1"}, {"row_id": ""}],
         }
-        self.assertEqual(MODULE.count_sync_targets(payload), 4)
+        self.assertEqual(MODULE.count_sync_targets(payload), 3)
 
     def test_progress_renderer_non_tty_writes_status_lines(self) -> None:
         buf = io.StringIO()

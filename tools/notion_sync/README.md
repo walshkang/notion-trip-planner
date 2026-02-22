@@ -27,6 +27,9 @@ set -a; source .env; set +a
 python notion_trip_sync.py init --database-id "$NOTION_DATABASE_ID" --out config.json
 ```
 
+If you deleted and recreated the Notion `Category` property, run `init` again before apply.
+Do not hand-edit property IDs in `config.json`.
+
 If your database has multiple data sources, select by name:
 ```bash
 python notion_trip_sync.py init \
@@ -50,7 +53,7 @@ Payload may be either:
 Example:
 ```text
 [sync] DRY RUN mode=patch targets=38
-| [#####...................] 8/38  21% CREATE category cat_meal_ireland_2026_03_05
+| [#####...................] 8/38  21% CREATE place place_cliffs_of_moher_coach_park_ireland_2026_03_05
 [sync] done in 1.2s
 ```
 
@@ -85,9 +88,28 @@ Hard-required (always fail on missing/wrong type):
 - `properties.type` -> `select`
 - `properties.row_id` -> `rich_text`
 
-Relation-required (`trip_rel`, `category_rel`, `place_rel`):
+Relation-required (`trip_rel`, `place_rel`):
 - strict or canonical: fail on missing/wrong type
 - non-strict patch: warn and skip relation writes
+
+Category select (`properties.category` -> `select`) is validated when category writes are needed:
+- patch + strict: fail on missing/wrong type
+- patch + non-strict: warn and skip category writes
+- canonical (strict or non-strict): fail on missing/wrong type
+
+## Category behavior (single select system)
+- Category relation is no longer used.
+- Allowed Category values: `Food`, `Coffee`, `Drinks`, `Activity`, `Logistics`.
+- Legacy labels map deterministically:
+  - `Meal` -> `Food`
+  - `Cafe` -> `Coffee`
+  - `Drinks` -> `Drinks`
+  - `Sights` -> `Activity`
+  - `Shopping` -> `Activity`
+- Unknown or unresolved category sources:
+  - patch + strict: fail
+  - patch + non-strict: warn and skip category update
+  - canonical: fail
 
 ## Checkbox (`book`) behavior
 - Patch mode:
@@ -109,7 +131,7 @@ python notion_trip_sync.py apply --config config.json --payload payload.json --e
 
 ## First live write checklist
 1. Database is shared with the integration.
-2. `init` output confirms `Row ID` is `rich_text`.
+2. `init` output confirms `Row ID` is `rich_text` and `Category` is `select`.
 3. Dry run (`patch + strict + dry-run`) has zero unreviewed warnings.
 4. First live apply uses the same flags minus `--dry-run`.
-5. Verify in Notion: Row IDs populated, relations present, no unexpected clears.
+5. Verify in Notion: Row IDs populated, trip/place relations present, Category values written as expected, no unexpected clears.

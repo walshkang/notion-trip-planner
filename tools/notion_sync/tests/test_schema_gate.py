@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from helpers import load_sync_module
 
@@ -12,8 +13,11 @@ def make_schema(type_overrides=None):
         "Type": "select",
         "Row ID": "rich_text",
         "Trip (link)": "relation",
-        "Category (link)": "relation",
         "Place (link)": "relation",
+        "Category": "select",
+        "Import Batch": "rich_text",
+        "Notes": "rich_text",
+        "Scaffold": "checkbox",
     }
     base.update(type_overrides)
 
@@ -47,16 +51,32 @@ def make_cfg(include_relations=True):
         "title": "Name",
         "type": "Type",
         "row_id": "Row ID",
+        "import_batch": "Import Batch",
+        "notes": "Notes",
+        "scaffold": "Scaffold",
+        "category": "Category",
     }
     if include_relations:
         cfg.update(
             {
                 "trip_rel": "Trip (link)",
-                "category_rel": "Category (link)",
                 "place_rel": "Place (link)",
             }
         )
     return cfg
+
+
+def make_config():
+    return {"properties": make_cfg()}
+
+
+def make_payload_with_category():
+    return {
+        "import_batch": "batch_1",
+        "trip": {"row_id": "trip_1", "name": "Trip"},
+        "places": [{"row_id": "place_1", "name": "Cafe", "type": "Place", "category": "Coffee"}],
+        "items": [],
+    }
 
 
 class TestSchemaGate(unittest.TestCase):
@@ -91,6 +111,115 @@ class TestSchemaGate(unittest.TestCase):
         with self.assertRaises(RuntimeError) as ctx:
             MODULE.validate_schema_requirements(schema, cfg, mode="canonical", strict=False, warnings=[])
         self.assertIn("expected 'relation'", str(ctx.exception))
+
+    def test_category_missing_patch_non_strict_warns_and_skips(self) -> None:
+        schema = make_schema()
+        config = make_config()
+        del config["properties"]["category"]
+        payload = make_payload_with_category()
+        captured_props = {}
+
+        def fake_upsert(_notion, _schema, _row_id_prop_id, row_id_value_str, properties, *, dry_run, strict, warnings):
+            captured_props[row_id_value_str] = dict(properties)
+            return f"PAGE-{row_id_value_str}", "CREATE"
+
+        with patch.object(MODULE, "upsert_page", side_effect=fake_upsert):
+            res = MODULE.sync_payload(
+                notion=None,
+                schema=schema,
+                config=config,
+                payload=payload,
+                dry_run=True,
+                enable_place=False,
+                mode="patch",
+                strict=False,
+            )
+
+        self.assertTrue(any("properties.category" in w for w in res["warnings"]))
+        category_prop_id = schema.id_by_name["Category"]
+        self.assertNotIn(category_prop_id, captured_props["place_1"])
+
+    def test_category_type_mismatch_patch_non_strict_warns_and_skips(self) -> None:
+        schema = make_schema({"Category": "rich_text"})
+        config = make_config()
+        payload = make_payload_with_category()
+        captured_props = {}
+
+        def fake_upsert(_notion, _schema, _row_id_prop_id, row_id_value_str, properties, *, dry_run, strict, warnings):
+            captured_props[row_id_value_str] = dict(properties)
+            return f"PAGE-{row_id_value_str}", "CREATE"
+
+        with patch.object(MODULE, "upsert_page", side_effect=fake_upsert):
+            res = MODULE.sync_payload(
+                notion=None,
+                schema=schema,
+                config=config,
+                payload=payload,
+                dry_run=True,
+                enable_place=False,
+                mode="patch",
+                strict=False,
+            )
+
+        self.assertTrue(any("expected 'select'" in w for w in res["warnings"]))
+        category_prop_id = schema.id_by_name["Category"]
+        self.assertNotIn(category_prop_id, captured_props["place_1"])
+
+    def test_category_missing_patch_strict_fails(self) -> None:
+        schema = make_schema()
+        config = make_config()
+        del config["properties"]["category"]
+        payload = make_payload_with_category()
+
+        with self.assertRaises(RuntimeError) as ctx:
+            MODULE.sync_payload(
+                notion=None,
+                schema=schema,
+                config=config,
+                payload=payload,
+                dry_run=True,
+                enable_place=False,
+                mode="patch",
+                strict=True,
+            )
+        self.assertIn("properties.category", str(ctx.exception))
+
+    def test_category_missing_canonical_fails_even_non_strict(self) -> None:
+        schema = make_schema()
+        config = make_config()
+        del config["properties"]["category"]
+        payload = make_payload_with_category()
+
+        with self.assertRaises(RuntimeError) as ctx:
+            MODULE.sync_payload(
+                notion=None,
+                schema=schema,
+                config=config,
+                payload=payload,
+                dry_run=True,
+                enable_place=False,
+                mode="canonical",
+                strict=False,
+            )
+        self.assertIn("properties.category", str(ctx.exception))
+
+    def test_category_type_mismatch_canonical_fails_even_non_strict(self) -> None:
+        schema = make_schema({"Category": "rich_text"})
+        config = make_config()
+        payload = make_payload_with_category()
+
+        with self.assertRaises(RuntimeError) as ctx:
+            MODULE.sync_payload(
+                notion=None,
+                schema=schema,
+                config=config,
+                payload=payload,
+                dry_run=True,
+                enable_place=False,
+                mode="canonical",
+                strict=False,
+            )
+        self.assertIn("expected 'select'", str(ctx.exception))
 
 
 if __name__ == "__main__":

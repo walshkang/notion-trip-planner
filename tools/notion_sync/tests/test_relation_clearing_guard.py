@@ -15,7 +15,7 @@ def make_schema():
         "Notes": "rich_text",
         "Scaffold": "checkbox",
         "Trip (link)": "relation",
-        "Category (link)": "relation",
+        "Category": "select",
         "Place (link)": "relation",
         "Start": "date",
         "End": "date",
@@ -57,7 +57,7 @@ def make_config():
             "notes": "Notes",
             "scaffold": "Scaffold",
             "trip_rel": "Trip (link)",
-            "category_rel": "Category (link)",
+            "category": "Category",
             "place_rel": "Place (link)",
             "start": "Start",
             "end": "End",
@@ -103,8 +103,11 @@ class TestRelationClearingGuard(unittest.TestCase):
             )
 
         place_rel_id = schema.id_by_name["Place (link)"]
+        category_id = schema.id_by_name["Category"]
         item_props = captured_props["item_1"]
         self.assertNotIn(place_rel_id, item_props)
+        self.assertNotIn(category_id, item_props)
+        self.assertNotIn(category_id, captured_props["place_1"])
 
 
 if __name__ == "__main__":

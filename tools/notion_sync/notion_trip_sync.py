@@ -17,7 +17,8 @@ Key behaviors:
 - Retries now include network exceptions + jitter
 - Schema gate:
   - hard-required: title/type/row_id
-  - relation-required: strict|canonical fail, patch non-strict warn+skip
+  - relation-required (trip/place): strict|canonical fail, patch non-strict warn+skip
+  - Category select: strict|canonical fail, patch non-strict warn+skip when Category is touched
 
 Upsert key: Row ID (rich text)
 
@@ -191,7 +192,7 @@ def count_sync_targets(payload: Dict[str, Any]) -> int:
     if isinstance(trip, dict) and trip.get("row_id"):
         total += 1
 
-    for key in ("categories", "places", "items"):
+    for key in ("places", "items"):
         for obj in payload.get(key) or []:
             if isinstance(obj, dict) and obj.get("row_id"):
                 total += 1
@@ -261,8 +262,10 @@ EXPECTED_PROPERTY_NAMES = {
     "Conf #": "conf",
     "Cost (total)": "cost_total",
     "Trip (link)": "trip_rel",
-    "Category (link)": "category_rel",
+    "Trip": "trip_rel",
+    "Category": "category",
     "Place (link)": "place_rel",
+    "Place": "place_rel",
     "Emoji": "emoji",
     "Travelers": "travelers",
     "Default buffer mins": "default_buffer_mins",
@@ -271,6 +274,7 @@ EXPECTED_PROPERTY_NAMES = {
     "Row ID": "row_id",
     "Import Batch": "import_batch",
     "Scaffold": "scaffold",
+    "Scaffold?": "scaffold",
     "Lat": "lat",
     "Lng": "lng",
     "Google Place ID": "google_place_id",
@@ -284,9 +288,35 @@ HARD_REQUIRED_PROPERTY_TYPES = {
 
 RELATION_PROPERTY_TYPES = {
     "trip_rel": "relation",
-    "category_rel": "relation",
     "place_rel": "relation",
 }
+
+CATEGORY_ALLOWLIST = ("Food", "Coffee", "Drinks", "Activity", "Logistics")
+CATEGORY_ALLOWLIST_SET = set(CATEGORY_ALLOWLIST)
+LEGACY_CATEGORY_ALIASES = {
+    "meal": "Food",
+    "cafe": "Coffee",
+    "drinks": "Drinks",
+    "sights": "Activity",
+    "shopping": "Activity",
+}
+
+
+def normalize_category_label(raw_value: Any) -> Tuple[Optional[str], bool, Optional[str]]:
+    if raw_value is None:
+        return None, True, None
+    if not isinstance(raw_value, str):
+        return None, False, f"Category must be a string or null; got {type(raw_value).__name__}."
+    value = raw_value.strip()
+    if not value:
+        return None, True, None
+    if value in CATEGORY_ALLOWLIST_SET:
+        return value, False, None
+    legacy = LEGACY_CATEGORY_ALIASES.get(value.lower())
+    if legacy:
+        return legacy, False, None
+    allowed = ", ".join(CATEGORY_ALLOWLIST)
+    return None, False, f"Unknown category '{value}'. Allowed values: {allowed}."
 
 
 def choose_data_source_id(notion: NotionClient, database_id: str, preferred_data_source_name: Optional[str] = None) -> Tuple[str, List[Dict[str, Any]]]:
@@ -326,7 +356,11 @@ def build_schema(ds_obj: Dict[str, Any]) -> DataSourceSchema:
 def auto_config_from_schema(schema: DataSourceSchema) -> Dict[str, Any]:
     props: Dict[str, Any] = {}
     for notion_name, key in EXPECTED_PROPERTY_NAMES.items():
-        props[key] = schema.id_by_name.get(notion_name)
+        found = schema.id_by_name.get(notion_name)
+        if found:
+            props[key] = found
+        elif key not in props:
+            props[key] = None
     props["title"] = schema.id_by_name.get("Name") or "title"
     return {
         "notion_version": DEFAULT_NOTION_VERSION,
@@ -527,6 +561,27 @@ def sync_payload(
     warnings: List[str] = []
     relation_enabled = validate_schema_requirements(schema, cfg_props, mode=mode, strict=strict, warnings=warnings)
 
+    place_objs = [p for p in (payload.get("places") or []) if isinstance(p, dict)]
+    item_objs = [i for i in (payload.get("items") or []) if isinstance(i, dict)]
+    wants_category = (
+        bool(place_objs or item_objs)
+        if mode == "canonical"
+        else any(("category" in p or "category_row_id" in p) for p in place_objs)
+        or any(("category" in i or "category_row_id" in i or "place_row_id" in i) for i in item_objs)
+    )
+    category_enabled = True
+    category_prop_id: Optional[str] = None
+    category_prop_type: Optional[str] = None
+    if wants_category:
+        configured = cfg_props.get("category")
+        category_prop_id, category_prop_type = resolve_prop(schema, configured)
+        if not category_prop_id or category_prop_type != "select":
+            msg = _schema_error_message("category", configured, "select", category_prop_type)
+            if strict or mode == "canonical":
+                raise RuntimeError("Schema validation failed:\n- " + msg)
+            warnings.append(msg + " Category writes will be skipped in patch/non-strict mode.")
+            category_enabled = False
+
     row_id_prop_id, row_id_prop_type = resolve_prop(schema, cfg_props.get("row_id"))
     if not row_id_prop_id:
         raise RuntimeError("Config is missing properties.row_id (Row ID property id/name). Run init or fill config.json.")
@@ -534,10 +589,52 @@ def sync_payload(
         raise RuntimeError(f"Row ID property must be rich_text. Got type '{row_id_prop_type}'.")
 
     import_batch = payload.get("import_batch", "")
+    categories_by_row_id: Dict[str, Dict[str, Any]] = {
+        c["row_id"]: c
+        for c in (payload.get("categories") or [])
+        if isinstance(c, dict) and c.get("row_id")
+    }
     places_by_row_id: Dict[str, Dict[str, Any]] = {p["row_id"]: p for p in (payload.get("places") or []) if isinstance(p, dict) and p.get("row_id")}
 
     page_ids: Dict[str, str] = {}
     actions: List[str] = []
+
+    category_skip = object()
+
+    def fail_or_warn_category(msg: str) -> None:
+        if strict or mode == "canonical":
+            raise ValueError(msg)
+        warnings.append(msg + " Skipping category update in patch/non-strict mode.")
+
+    def normalize_explicit_category(raw_value: Any, *, row_label: str) -> Any:
+        normalized, explicit_clear, err = normalize_category_label(raw_value)
+        if err:
+            fail_or_warn_category(f"{row_label}: {err}")
+            return category_skip
+        if explicit_clear:
+            return None
+        return normalized
+
+    def normalize_legacy_category_name(raw_value: Any, *, row_label: str, source_label: str) -> Any:
+        normalized, explicit_clear, err = normalize_category_label(raw_value)
+        if err:
+            fail_or_warn_category(f"{row_label}: {source_label}: {err}")
+            return category_skip
+        if explicit_clear:
+            fail_or_warn_category(f"{row_label}: {source_label} resolved to an empty category.")
+            return category_skip
+        return normalized
+
+    def resolve_legacy_category_row(category_row_id: Any, *, row_label: str, source_label: str) -> Any:
+        if not isinstance(category_row_id, str) or not category_row_id.strip():
+            fail_or_warn_category(f"{row_label}: {source_label} must be a non-empty string.")
+            return category_skip
+        clean_row_id = category_row_id.strip()
+        category_obj = categories_by_row_id.get(clean_row_id)
+        if not category_obj:
+            fail_or_warn_category(f"{row_label}: {source_label} '{clean_row_id}' was not found in payload.categories.")
+            return category_skip
+        return normalize_legacy_category_name(category_obj.get("name"), row_label=row_label, source_label=f"{source_label} name")
 
     # Trip
     trip = payload.get("trip") or {}
@@ -582,34 +679,6 @@ def sync_payload(
     if progress:
         progress.tick(stage="trip", row_id=trip_row_id, action=act)
 
-    # Categories
-    for cat in payload.get("categories") or []:
-        if not isinstance(cat, dict) or not cat.get("row_id"):
-            continue
-        rid = cat["row_id"]
-        props = build_base_properties(
-            schema, cfg_props,
-            name=cat.get("name") or "Category",
-            type_value_str=cat.get("type") or "Category",
-            row_id=rid,
-            import_batch=import_batch,
-            notes=(cat.get("notes") or "").strip(),
-            scaffold=bool(cat.get("scaffold", False)),
-        )
-        if should_touch(mode, cat, "emoji"):
-            pid, ptype = resolve_prop(schema, cfg_props.get("emoji"))
-            set_prop(props, pid, ptype, rich_text_value(cat.get("emoji")))
-
-        pid, ptype = resolve_prop(schema, cfg_props.get("trip_rel"))
-        if relation_enabled.get("trip_rel", True) and pid and ptype == "relation":
-            set_prop(props, pid, ptype, relation_value([trip_page_id]))
-
-        _, act = upsert_page(notion, schema, row_id_prop_id, rid, props, dry_run=dry_run, strict=strict, warnings=warnings)
-        actions.append(act)
-        page_ids[rid] = page_ids.get(rid) or _
-        if progress:
-            progress.tick(stage="category", row_id=rid, action=act)
-
     # Places
     for pl in payload.get("places") or []:
         if not isinstance(pl, dict) or not pl.get("row_id"):
@@ -644,20 +713,24 @@ def sync_payload(
         if relation_enabled.get("trip_rel", True) and pid and ptype == "relation":
             set_prop(props, pid, ptype, relation_value([trip_page_id]))
 
-        pid, ptype = resolve_prop(schema, cfg_props.get("category_rel"))
-        if relation_enabled.get("category_rel", True) and pid and ptype == "relation" and should_touch(mode, pl, "category_row_id"):
-            cat_rid = pl.get("category_row_id")
-            if not cat_rid:
-                set_prop(props, pid, ptype, relation_value([]))
-            else:
-                cat_pid = page_ids.get(cat_rid)
-                if cat_pid:
-                    set_prop(props, pid, ptype, relation_value([cat_pid]))
-                else:
-                    msg = f"Place '{rid}' references unknown category_row_id '{cat_rid}'."
-                    if strict:
-                        raise NotionAPIError(msg)
-                    warnings.append(msg)
+        should_touch_category = should_touch(mode, pl, "category") or should_touch(mode, pl, "category_row_id")
+        if category_enabled and should_touch_category:
+            category_value: Any = category_skip
+            if "category" in pl:
+                category_value = normalize_explicit_category(pl.get("category"), row_label=f"Place '{rid}'")
+            elif "category_row_id" in pl:
+                category_value = resolve_legacy_category_row(
+                    pl.get("category_row_id"),
+                    row_label=f"Place '{rid}'",
+                    source_label="category_row_id",
+                )
+            elif mode == "canonical":
+                fail_or_warn_category(
+                    f"Place '{rid}': canonical mode requires 'category' or a resolvable 'category_row_id'."
+                )
+
+            if category_value is not category_skip:
+                set_prop(props, category_prop_id, category_prop_type, select_value(category_value))
 
         if enable_place:
             pid, ptype = resolve_prop(schema, cfg_props.get("location"))
@@ -749,22 +822,50 @@ def sync_payload(
                         raise NotionAPIError(msg)
                     warnings.append(msg)
 
-        pid, ptype = resolve_prop(schema, cfg_props.get("category_rel"))
-        if relation_enabled.get("category_rel", True) and pid and ptype == "relation" and should_touch_place_rel:
-            place_rid = it.get("place_row_id")
-            if not place_rid:
-                set_prop(props, pid, ptype, relation_value([]))
+        should_touch_category = (
+            should_touch(mode, it, "category")
+            or should_touch(mode, it, "category_row_id")
+            or should_touch(mode, it, "place_row_id")
+        )
+        if category_enabled and should_touch_category:
+            category_value: Any = category_skip
+            if "category" in it:
+                category_value = normalize_explicit_category(it.get("category"), row_label=f"Item '{rid}'")
+            elif "category_row_id" in it:
+                category_value = resolve_legacy_category_row(
+                    it.get("category_row_id"),
+                    row_label=f"Item '{rid}'",
+                    source_label="category_row_id",
+                )
             else:
-                place_obj = places_by_row_id.get(place_rid)
-                if place_obj and place_obj.get("category_row_id"):
-                    cat_pid = page_ids.get(place_obj.get("category_row_id"))
-                    if cat_pid:
-                        set_prop(props, pid, ptype, relation_value([cat_pid]))
+                place_rid = it.get("place_row_id")
+                if place_rid:
+                    place_obj = places_by_row_id.get(place_rid)
+                    if not place_obj:
+                        fail_or_warn_category(f"Item '{rid}': place_row_id '{place_rid}' was not found in payload.places.")
+                    elif "category" in place_obj:
+                        category_value = normalize_legacy_category_name(
+                            place_obj.get("category"),
+                            row_label=f"Item '{rid}'",
+                            source_label=f"place '{place_rid}' category",
+                        )
+                    elif "category_row_id" in place_obj:
+                        category_value = resolve_legacy_category_row(
+                            place_obj.get("category_row_id"),
+                            row_label=f"Item '{rid}'",
+                            source_label=f"place '{place_rid}' category_row_id",
+                        )
                     else:
-                        msg = f"Item '{rid}' inferred unknown category_row_id '{place_obj.get('category_row_id')}'."
-                        if strict:
-                            raise NotionAPIError(msg)
-                        warnings.append(msg)
+                        fail_or_warn_category(
+                            f"Item '{rid}': place '{place_rid}' has no category/category_row_id to infer Category."
+                        )
+                elif mode == "canonical":
+                    fail_or_warn_category(
+                        f"Item '{rid}': canonical mode requires 'category', 'category_row_id', or inferable 'place_row_id'."
+                    )
+
+            if category_value is not category_skip:
+                set_prop(props, category_prop_id, category_prop_type, select_value(category_value))
 
         _, act = upsert_page(notion, schema, row_id_prop_id, rid, props, dry_run=dry_run, strict=strict, warnings=warnings)
         actions.append(act)
